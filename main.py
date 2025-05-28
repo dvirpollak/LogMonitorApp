@@ -5,11 +5,38 @@ import subprocess
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QLineEdit, QPushButton,
     QTabWidget, QMessageBox, QListWidget, QListWidgetItem, QHBoxLayout,
-    QInputDialog, QMenu
+    QInputDialog, QMenu, QFileDialog
 )
-from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtCore import Qt, QPoint, QTimer
+from PyQt5.QtGui import QCursor
 
 CONFIG_FILE = "monitor_config.json"
+
+def show_manual():
+    msg = QMessageBox()
+    msg.setWindowTitle("User Manual")
+    msg.setText("""
+    Welcome to the Log Monitor App!
+
+    - Add Log File: Add a new tab for a log.
+    - Add/Edit/Remove Filters: Manage filters for matching lines.
+    - Start Real-time Monitor: Open terminal and show log updates live.
+    - Stop Monitoring: Stop the real-time process.
+    - Cat in Terminal: View entire log in a terminal.
+    - Cat to File: Save full log to a file.
+    - Export to CSV: Save log in CSV format, parsing structured lines.
+    
+
+    Please read this manual before using the application.
+    """)
+    msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+    result = msg.exec_()
+
+
+def show_manual_if_required():
+    if len(sys.argv) > 1:
+        return
+    show_manual()
 
 
 class LogTab(QWidget):
@@ -18,6 +45,9 @@ class LogTab(QWidget):
         self.parent = parent
         self.log_path = log_path
         self.filters = filters if isinstance(filters, list) else []
+        self.monitor_process = None
+        self.monitor_timer = QTimer()
+        self.monitor_timer.timeout.connect(self.check_monitor_status)
 
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
@@ -43,10 +73,8 @@ class LogTab(QWidget):
         filter_buttons = QHBoxLayout()
         add_filter_btn = QPushButton("Add Filter")
         add_filter_btn.clicked.connect(self.add_filter)
-
         remove_filter_btn = QPushButton("Remove Selected")
         remove_filter_btn.clicked.connect(self.remove_filter)
-
         edit_filter_btn = QPushButton("Edit Selected")
         edit_filter_btn.clicked.connect(self.edit_filter)
 
@@ -55,9 +83,32 @@ class LogTab(QWidget):
         filter_buttons.addWidget(remove_filter_btn)
         self.layout.addLayout(filter_buttons)
 
-        monitor_btn = QPushButton("Start Monitoring")
-        monitor_btn.clicked.connect(self.start_monitoring)
-        self.layout.addWidget(monitor_btn)
+        monitor_buttons = QHBoxLayout()
+        realtime_btn = QPushButton("Start Real-time Monitor")
+        realtime_btn.clicked.connect(self.start_monitoring)
+        self.stop_btn = QPushButton("Stop Monitoring")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_monitoring)
+
+        monitor_buttons.addWidget(realtime_btn)
+        monitor_buttons.addWidget(self.stop_btn)
+        self.layout.addLayout(monitor_buttons)
+
+        offline_buttons = QHBoxLayout()
+        cat_terminal = QPushButton("Cat in Terminal")
+        cat_terminal.clicked.connect(self.cat_terminal)
+        cat_file = QPushButton("Cat to File")
+        cat_file.clicked.connect(self.cat_to_file)
+        export_csv = QPushButton("Export to CSV")
+        export_csv.clicked.connect(self.export_to_csv)
+
+        offline_buttons.addWidget(cat_terminal)
+        offline_buttons.addWidget(cat_file)
+        offline_buttons.addWidget(export_csv)
+        self.layout.addLayout(offline_buttons)
+
+        self.status_label = QLabel("")
+        self.layout.addWidget(self.status_label)
 
     def add_filter_item(self, text, checked=True):
         item = QListWidgetItem(text)
@@ -111,28 +162,72 @@ class LogTab(QWidget):
     def start_monitoring(self):
         log_path = self.get_log_path()
         selected_filters = self.get_selected_filters()
-
         if not log_path:
             QMessageBox.warning(self, "Missing input", "Please provide a log file.")
             return
-
         command = f"tail -F '{log_path}'"
         for f in selected_filters:
             command += f" | grep --line-buffered '{f}'"
-
         try:
-            subprocess.Popen([
+            self.monitor_process = subprocess.Popen([
                 "gnome-terminal", "--", "bash", "-c", f"{command}; exec bash"
             ])
+            self.status_label.setText("Monitoring started.")
+            self.stop_btn.setEnabled(True)
+            self.monitor_timer.start(1000)
         except FileNotFoundError:
-            QMessageBox.critical(self, "Terminal error", "gnome-terminal not found. Install or update the terminal command.")
+            QMessageBox.critical(self, "Terminal error", "gnome-terminal not found.")
 
+    def stop_monitoring(self):
+        if self.monitor_process and self.monitor_process.poll() is None:
+            self.monitor_process.terminate()
+        self.monitor_process = None
+        self.monitor_timer.stop()
+        self.status_label.setText("Monitoring stopped.")
+        self.stop_btn.setEnabled(False)
+
+    def check_monitor_status(self):
+        if self.monitor_process and self.monitor_process.poll() is not None:
+            self.status_label.setText("Monitoring stopped (terminal closed).")
+            self.stop_btn.setEnabled(False)
+            self.monitor_timer.stop()
+            self.monitor_process = None
+
+    def cat_terminal(self):
+        log_path = self.get_log_path()
+        if log_path:
+            subprocess.Popen(["gnome-terminal", "--", "bash", "-c", f"cat '{log_path}'; exec bash"])
+
+    def cat_to_file(self):
+        log_path = self.get_log_path()
+        if log_path:
+            target, _ = QFileDialog.getSaveFileName(self, "Save Output", "output.txt")
+            if target:
+                with open(log_path) as f_in, open(target, 'w') as f_out:
+                    f_out.write(f_in.read())
+
+    def export_to_csv(self):
+        log_path = self.get_log_path()
+        if not log_path or not os.path.exists(log_path):
+            QMessageBox.warning(self, "File Error", "Log file does not exist.")
+            return
+        target, _ = QFileDialog.getSaveFileName(self, "Save CSV", "output.csv")
+        if not target:
+            return
+        with open(log_path, 'r') as f_in, open(target, 'w') as f_out:
+            for line in f_in:
+                parts = []
+                if line.startswith("["):
+                    parts = line.split("]")
+                    parts = [p.strip("[\"] ") for p in parts if p.strip()]
+                if len(parts) >= 4:
+                    f_out.write(",".join(parts[:3]) + f',"{parts[3]}"\n')
 
 class LogMonitorApp(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Log Monitor")
-        self.resize(700, 500)
+        self.resize(800, 600)
 
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
@@ -140,11 +235,15 @@ class LogMonitorApp(QWidget):
         self.tabs = QTabWidget()
         self.layout.addWidget(self.tabs)
 
+        top_buttons = QHBoxLayout()
         self.add_tab_button = QPushButton("➕ Add New Log File")
         self.add_tab_button.clicked.connect(self.add_log_tab)
-        self.layout.addWidget(self.add_tab_button)
+        help_button = QPushButton("❓ Help")
+        help_button.clicked.connect(show_manual)
+        top_buttons.addWidget(self.add_tab_button)
+        top_buttons.addWidget(help_button)
+        self.layout.addLayout(top_buttons)
 
-        # Add tab context menu
         self.tabs.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tabs.customContextMenuRequested.connect(self.show_tab_context_menu)
 
@@ -183,22 +282,18 @@ class LogMonitorApp(QWidget):
         tab_index = self.tabs.tabBar().tabAt(pos)
         if tab_index < 0:
             return
-
         menu = QMenu()
         rename_action = menu.addAction("Rename Tab")
         close_action = menu.addAction("Close Tab (Keep Config)")
         delete_action = menu.addAction("Delete Log Config")
-
         action = menu.exec_(self.tabs.mapToGlobal(pos))
         if action == rename_action:
             current_title = self.tabs.tabText(tab_index)
             new_title, ok = QInputDialog.getText(self, "Rename Tab", "New tab name:", text=current_title)
             if ok and new_title.strip():
                 self.tabs.setTabText(tab_index, new_title.strip())
-
         elif action == close_action:
             self.tabs.removeTab(tab_index)
-
         elif action == delete_action:
             tab = self.tabs.widget(tab_index)
             log_path = tab.get_log_path()
@@ -207,9 +302,20 @@ class LogMonitorApp(QWidget):
                 self.save_config()
             self.tabs.removeTab(tab_index)
 
-
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    show_manual_if_required()
+    app.setStyleSheet("""
+        QWidget { background-color: #f8f9fa; color: #212529; font-size: 14px; }
+        QLineEdit, QListWidget, QTextEdit {
+            background-color: white; color: #212529; border: 1px solid #ced4da;
+        }
+        QPushButton {
+            background-color: #007bff; color: white; padding: 6px; border-radius: 4px;
+        }
+        QPushButton:hover { background-color: #0056b3; }
+        QLabel { font-weight: bold; }
+    """)
     window = LogMonitorApp()
     window.show()
     sys.exit(app.exec_())
